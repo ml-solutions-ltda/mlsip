@@ -1,211 +1,229 @@
-# mlsip/application.py
+"""
+Application module for MLSIP.
+Similar structure to aiohttp.web.Application
+"""
+import sys
 import asyncio
 import logging
+import aiodns
+from contextlib import suppress
 import traceback
 from collections.abc import MutableMapping
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 
-import aiodns  # Resolver de DNS assíncrono
-
-from .dialplan import Dialplan
-from .protocol import Protocol, create_connector
+from . import __version__
 from .dialog import Dialog
-from .peers import Peer
+from .dialplan import BaseDialplan
+from .protocol import UDP, TCP, WS
+from .peers import UDPConnector, TCPConnector, WSConnector
+from .message import Response
 from .contact import Contact
 from .via import Via
 
-LOG = logging.getLogger("mlsip")
+__all__ = ['Application']
 
-Middleware = Callable[["Application", Any, Any, Callable], Awaitable[Any]]
-Handler = Callable[[Any, Any], Awaitable[Any]]
+LOG = logging.getLogger(__name__)
+
+DEFAULTS = {
+    'user_agent': f'Python/{sys.version_info[0]}.{sys.version_info[1]}.{sys.version_info[2]} mlsip/{__version__}',
+    'override_contact_host': None,
+    'dialog_closing_delay': 30
+}
 
 
 class Application(MutableMapping):
-    """
-    Representa uma aplicação SIP.
+    def __init__(self, *, loop=None, middleware=(), defaults=None, debug=False,
+                 dialplan=None, dns_resolver=None):
+        self.loop = loop or asyncio.get_event_loop()
+        self.debug = debug
+        self._finish_callbacks = []
+        self._state = {}
+        self._dialogs = {}
+        self._middleware = middleware
+        self._tasks = []
 
-    Gerencia:
-      - Middlewares
-      - Dialplan (roteamento de requisições)
-      - Peers e diálogos
-      - Conexões (UDP, TCP, WS)
-      - Ciclo de vida (inicialização e fechamento)
+        self.defaults = {**DEFAULTS, **(defaults or {})}
+        self.dialplan = dialplan or BaseDialplan()
+        self.dns = dns_resolver or aiodns.DNSResolver()
 
-    Exemplo de uso:
-        app = Application()
-        app["user_agent"] = "mlsip/0.1"
-        app.run_forever()
-    """
-
-    def __init__(self, loop: Optional[asyncio.AbstractEventLoop] = None, **kwargs: Any) -> None:
-        self.loop: asyncio.AbstractEventLoop = loop or asyncio.get_event_loop()
-        self.dns: aiodns.DNSResolver = aiodns.DNSResolver(loop=self.loop)
-
-        # Middlewares de tratamento
-        self._middlewares: List[Middleware] = [
-            self.error_middleware,
-            self.middleware,
-        ]
-
-        # Configurações padrão
-        self._defaults: Dict[str, Any] = {
-            "user_agent": "mlsip/0.1",
-            "override_contact_host": None,
-            "override_contact_port": None,
-            "outbound_proxy": None,
+        # Connectors
+        self._connectors = {
+            UDP: UDPConnector(self, loop=self.loop),
+            TCP: TCPConnector(self, loop=self.loop),
+            WS: WSConnector(self, loop=self.loop)
         }
 
-        # Estado interno
-        self.dialplan: Dialplan = Dialplan()
-        self._connectors: List[Callable] = []
-        self._protocols: List[Protocol] = []
-        self._peers: Dict[str, Peer] = {}
-        self._dialogs: Dict[str, Dialog] = {}
-        self._fut: Optional[asyncio.Future] = None
-
-        # Configurações dinâmicas (dict-like)
-        self._kwargs: Dict[str, Any] = kwargs
-
-    # ---------------------------------------------------------------------
-    # Propriedades auxiliares
-    # ---------------------------------------------------------------------
+    @property
+    def peers(self):
+        for connector in self._connectors.values():
+            yield from connector._peers.values()
 
     @property
-    def user_agent(self) -> str:
-        """Retorna o User-Agent configurado."""
-        return self._kwargs.get("user_agent", self._defaults["user_agent"])
+    def dialogs(self):
+        yield from set(self._dialogs.values())
 
-    # ---------------------------------------------------------------------
-    # Middlewares
-    # ---------------------------------------------------------------------
+    async def connect(self, remote_addr, protocol=UDP, *, local_addr=None, **kwargs):
+        connector = self._connectors[protocol]
+        return await connector.create_peer(remote_addr, local_addr=local_addr, **kwargs)
 
-    async def middleware(self, app: "Application", msg: Any, addr: Any, handler: Handler) -> Any:
-        """Middleware padrão que apenas despacha a requisição."""
-        return await handler(msg, addr)
+    async def run(self, *, local_addr=None, protocol=UDP, sock=None, **kwargs):
+        if not local_addr and not sock:
+            raise ValueError('One of "local_addr" or "sock" is mandatory')
+        if local_addr and sock:
+            raise ValueError('"local_addr" and "sock" are mutually exclusive')
+        connector = self._connectors[protocol]
+        return await connector.create_server(local_addr or (None, None), sock, **kwargs)
 
-    async def error_middleware(self, app: "Application", msg: Any, addr: Any, handler: Handler) -> Any:
-        """Captura exceções e envia resposta SIP 500 (Internal Error)."""
-        try:
-            return await handler(msg, addr)
-        except Exception as e:
-            LOG.exception("Erro ao processar mensagem SIP")
-            try:
-                await app._respond(msg, code=500, reason="Internal Error")
-            except Exception:
-                LOG.error("Falha ao enviar resposta de erro", exc_info=True)
-            return None
+    async def _call_route(self, peer, route, msg):
+        for middleware_factory in reversed(self._middleware):
+            route = await middleware_factory(route)
 
-    # ---------------------------------------------------------------------
-    # Configuração e registro
-    # ---------------------------------------------------------------------
+        call_id = msg.headers['Call-ID']
 
-    def add_protocol(self, proto: Protocol) -> None:
-        """Adiciona protocolo ativo (UDP/TCP/WS)."""
-        self._protocols.append(proto)
+        class Request:
+            def __init__(self):
+                self.dialog = None
+                self.app = self
 
-    def add_connector(self, protocol: str, *args: Any, **kwargs: Any) -> None:
-        """Registra um conector (ex.: UDP, TCP)."""
-        self._connectors.append(create_connector(protocol, *args, **kwargs))
+            def _create_dialog(self, dialog_factory=Dialog, **kwargs):
+                if not self.dialog:
+                    self.dialog = peer._create_dialog(
+                        method=msg.method,
+                        from_details=Contact.from_header(msg.headers['To']),
+                        to_details=Contact.from_header(msg.headers['From']),
+                        call_id=call_id,
+                        inbound=True,
+                        dialog_factory=dialog_factory,
+                        **kwargs
+                    )
+                return self.dialog
 
-    def register_peer(self, peer: Peer) -> None:
-        """Registra um peer SIP."""
-        self._peers[peer.name] = peer
+            async def prepare(self, status_code, *args, **kwargs):
+                dialog = self._create_dialog()
+                await dialog.reply(msg, status_code, *args, **kwargs)
+                if status_code >= 300:
+                    await dialog.close()
+                    return None
+                return dialog
 
-    def unregister_peer(self, peer: Peer) -> None:
-        """Remove um peer SIP registrado."""
-        self._peers.pop(peer.name, None)
+        request = Request()
+        await route(request, msg)
 
-    # ---------------------------------------------------------------------
-    # Ciclo de vida
-    # ---------------------------------------------------------------------
+    async def _dispatch(self, protocol, msg, addr):
+        call_id = msg.headers['Call-ID']
+        dialog = None
 
-    def run_forever(self) -> None:
-        """Executa a aplicação indefinidamente."""
-        self._fut = asyncio.ensure_future(self._run(), loop=self.loop)
-        try:
-            self.loop.run_forever()
-        except KeyboardInterrupt:
-            LOG.info("Encerrando aplicação SIP...")
-            self.loop.run_until_complete(self.close())
+        # Try to find existing dialog by tags
+        if 'tag' in msg.to_details['params']:
+            dialog = self._dialogs.get(frozenset((msg.to_details['params']['tag'],
+                                                  msg.from_details['params']['tag'],
+                                                  call_id)))
+        if dialog is None:
+            dialog = self._dialogs.get(frozenset((None, msg.from_details['params']['tag'], call_id)))
 
-    async def _run(self) -> None:
-        """Inicializa todos os conectores registrados."""
-        for connector in self._connectors:
-            await connector(self)
-
-    async def finish(self) -> None:
-        """Finaliza peers ativos."""
-        for peer in list(self._peers.values()):
-            try:
-                await peer.close()
-            except Exception:
-                LOG.warning("Erro ao fechar peer %s", peer.name, exc_info=True)
-
-    async def close(self) -> None:
-        """Fecha protocolos e finaliza execução."""
-        await self.finish()
-
-        for proto in self._protocols:
-            proto.close()
-
-        if self._fut:
-            self._fut.cancel()
-
-    # ---------------------------------------------------------------------
-    # Roteamento de mensagens
-    # ---------------------------------------------------------------------
-
-    async def _dispatch(self, msg: Any, addr: Any, protocol: Protocol) -> None:
-        """Despacha uma mensagem SIP pelo pipeline de middlewares."""
-        async def handler(m: Any, a: Any) -> Any:
-            return await self._run_dialplan(m, a, protocol)
-
-        middleware_chain = handler
-        for m in reversed(self._middlewares):
-            next_handler = middleware_chain
-            middleware_chain = lambda m=msg, a=addr, mw=m, nh=next_handler: mw(self, m, a, nh)
-
-        await middleware_chain(msg, addr)
-
-    async def _run_dialplan(self, msg: Any, addr: Any, protocol: Protocol) -> None:
-        """Executa o dialplan para uma mensagem SIP."""
-        dialog_id = Dialog.compute_id(msg)
-        if dialog_id in self._dialogs:
-            dialog = self._dialogs[dialog_id]
-            await dialog.run(msg, addr, protocol)
+        if dialog:
+            await dialog.receive_message(msg)
             return
 
-        handler = self.dialplan.resolve(msg)
-        if handler:
-            await handler(self, msg, addr, protocol)
-        else:
-            await self._respond(msg, code=501, reason="Not Implemented")
+        # Drop ACK or unmatched responses
+        if isinstance(msg, Response) or msg.method == 'ACK':
+            LOG.debug('Discarding incoming message: %s', msg)
+            return
 
-    # ---------------------------------------------------------------------
-    # Respostas SIP utilitárias
-    # ---------------------------------------------------------------------
+        await self._run_dialplan(protocol, msg)
 
-    async def _respond(self, msg: Any, code: int, reason: str) -> None:
-        """Envia uma resposta SIP simples."""
-        proto = msg.protocol  # assumindo que msg já tem protocolo associado
-        await proto.send_response(msg, code=code, reason=reason)
+    async def _run_dialplan(self, protocol, msg):
+        call_id = msg.headers['Call-ID']
+        via_header = msg.headers['Via']
+        if isinstance(via_header, list):
+            via_header = via_header[0]
 
-    # ---------------------------------------------------------------------
+        connector = self._connectors[type(protocol)]
+        via = Via.from_header(via_header)
+        via_addr = via['host'], int(via['port'])
+        peer = await connector.get_peer(protocol, via_addr)
+
+        async def reply(*args, **kwargs):
+            dialog = peer._create_dialog(
+                method=msg.method,
+                from_details=Contact.from_header(msg.headers['To']),
+                to_details=Contact.from_header(msg.headers['From']),
+                call_id=call_id,
+                inbound=True
+            )
+            await dialog.reply(*args, **kwargs)
+            await dialog.close()
+
+        try:
+            route = await self.dialplan.resolve(
+                method=msg.method,
+                message=msg,
+                protocol=peer.protocol,
+                local_addr=peer.local_addr,
+                remote_addr=peer.peer_addr
+            )
+            if not route or not asyncio.iscoroutinefunction(route):
+                await reply(msg, status_code=501)
+                return
+            task = asyncio.ensure_future(self._call_route(peer, route, msg))
+            self._tasks.append(task)
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            payload = None
+            if self.debug:
+                with suppress(Exception):
+                    payload = traceback.format_exc()
+            LOG.exception("Error in dialplan")
+            await reply(msg, status_code=500, payload=payload)
+
+    def _connection_lost(self, protocol):
+        connector = self._connectors[type(protocol)]
+        connector.connection_lost(protocol)
+
+    async def finish(self):
+        callbacks, self._finish_callbacks = self._finish_callbacks, []
+        for cb, args, kwargs in callbacks:
+            try:
+                res = cb(self, *args, **kwargs)
+                if asyncio.iscoroutine(res) or isinstance(res, asyncio.Future):
+                    await res
+            except Exception as exc:
+                self.loop.call_exception_handler({
+                    'message': "Error in finish callback",
+                    'exception': exc,
+                    'application': self,
+                })
+
+    def register_on_finish(self, func, *args, **kwargs):
+        self._finish_callbacks.insert(0, (func, args, kwargs))
+
+    async def close(self, timeout=5):
+        for dialog in set(self._dialogs.values()):
+            try:
+                await dialog.close(timeout=timeout)
+            except asyncio.TimeoutError:
+                pass
+        for connector in self._connectors.values():
+            await connector.close()
+        for task in self._tasks:
+            task.cancel()
+
     # MutableMapping API
-    # ---------------------------------------------------------------------
+    def __getitem__(self, key):
+        return self._state[key]
 
-    def __getitem__(self, key: str) -> Any:
-        return self._kwargs.get(key, self._defaults.get(key))
+    def __setitem__(self, key, value):
+        self._state[key] = value
 
-    def __setitem__(self, key: str, value: Any) -> None:
-        self._kwargs[key] = value
+    def __delitem__(self, key):
+        del self._state[key]
 
-    def __delitem__(self, key: str) -> None:
-        if key in self._kwargs:
-            del self._kwargs[key]
+    def __len__(self):
+        return len(self._state)
 
     def __iter__(self):
-        return iter({**self._defaults, **self._kwargs})
+        return iter(self._state)
 
-    def __len__(self) -> int:
-        return len({**self._defaults, **self._kwargs})
+    def __eq__(self, other):
+        return self is other
