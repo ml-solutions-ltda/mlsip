@@ -1,0 +1,28 @@
+sudo: required
+services:
+    - docker
+
+language: python
+
+python:
+    - 3.11
+
+cache:
+    directories:
+        - $HOME/.cache/pip
+
+before_cache:
+    - rm -f $HOME/.cache/pip/log/debug.log
+
+install:
+    - pip install --upgrade pip wheel
+    - pip install --upgrade setuptools
+    - pip install flake8
+    - pip install pytest pytest-cov pytest-asyncio codecov uvloop -e .
+
+script:
+    - flake8 mlsip examples tests
+    - py.test --cov=mlsip --cov-report=term --cov-report=html --cov-append --loop pyloop,uvloop tests
+
+after_success:
+    - codecov
