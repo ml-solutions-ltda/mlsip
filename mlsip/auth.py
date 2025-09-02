@@ -1,158 +1,204 @@
-"""
-mlsip.auth
-~~~~~~~~~~
+from collections.abc import MutableMapping
+from enum import Enum
+from hashlib import md5
+import logging
 
-Módulo de autenticação SIP baseado em Digest Authentication (RFC 3261 / RFC 2617).
-Responsável por gerar e validar cabeçalhos Authorization e WWW-Authenticate.
-"""
-
-import hashlib
-import os
-import re
-import time
-from typing import Optional, Dict
+from . import utils
 
 
-# ==========================================================
-# Funções utilitárias
-# ==========================================================
-
-def _md5_hex(data: str) -> str:
-    """Retorna o MD5 hexdigest de uma string."""
-    return hashlib.md5(data.encode("utf-8")).hexdigest()
+LOG = logging.getLogger(__name__)
 
 
-def _gen_nonce() -> str:
-    """Gera um nonce aleatório para desafio de autenticação."""
-    return hashlib.md5(f"{time.time()}-{os.urandom(8)}".encode("utf-8")).hexdigest()
+class Algorithm(Enum):
+    MD5 = 'md5'
+    MD5Sess = 'md5-sess'
 
 
-# ==========================================================
-# Classes principais
-# ==========================================================
-
-class DigestChallenge:
-    """
-    Representa um desafio WWW-Authenticate enviado pelo servidor.
-    Exemplo:
-        WWW-Authenticate: Digest realm="mlsip", nonce="abc123", algorithm=MD5, qop="auth"
-    """
-
-    def __init__(self, realm: str, algorithm: str = "MD5", qop: str = "auth"):
-        self.realm = realm
-        self.nonce = _gen_nonce()
-        self.algorithm = algorithm.upper()
-        self.qop = qop
-
-    def to_header(self) -> str:
-        """Gera o cabeçalho WWW-Authenticate."""
-        return (
-            f'Digest realm="{self.realm}", '
-            f'nonce="{self.nonce}", '
-            f'algorithm={self.algorithm}, '
-            f'qop="{self.qop}"'
-        )
+class Directive(Enum):
+    Unspecified = ''
+    Auth = 'auth'
+    AuthInt = 'auth-int'
 
 
-class DigestResponse:
-    """
-    Representa a resposta de autenticação enviada pelo cliente no cabeçalho Authorization.
-    Calcula e valida a resposta MD5 de acordo com o desafio do servidor.
-    """
+def md5digest(*args):
+    return md5(':'.join(args).encode()).hexdigest()
 
-    def __init__(
-        self,
-        username: str,
-        password: str,
-        method: str,
-        uri: str,
-        realm: str,
-        nonce: str,
-        nc: str = "00000001",
-        cnonce: Optional[str] = None,
-        qop: str = "auth",
-        algorithm: str = "MD5",
-    ):
-        self.username = username
-        self.password = password
-        self.method = method
-        self.uri = uri
-        self.realm = realm
-        self.nonce = nonce
-        self.nc = nc
-        self.cnonce = cnonce or _gen_nonce()
-        self.qop = qop
-        self.algorithm = algorithm.upper()
 
-        self.response = self._calculate_response()
+class Auth(MutableMapping):
+    def __init__(self, mode='Digest', **kwargs):
+        self._auth = kwargs
+        self.mode = mode
 
-    # ------------------------------------------------------
+        if self.mode != 'Digest':
+            raise ValueError('Authentication method not supported')
 
-    def _calculate_response(self) -> str:
-        """Calcula o hash de resposta (HA1/HA2/response)."""
-        if self.algorithm != "MD5":
-            raise ValueError(f"Algoritmo não suportado: {self.algorithm}")
+    def __str__(self, **kwargs):
+        if not kwargs:
+            kwargs = self._auth
 
-        ha1 = _md5_hex(f"{self.username}:{self.realm}:{self.password}")
-        ha2 = _md5_hex(f"{self.method}:{self.uri}")
-
-        return _md5_hex(
-            f"{ha1}:{self.nonce}:{self.nc}:{self.cnonce}:{self.qop}:{ha2}"
-        )
-
-    def to_header(self) -> str:
-        """Retorna o cabeçalho Authorization pronto para envio."""
-        return (
-            f'Digest username="{self.username}", '
-            f'realm="{self.realm}", '
-            f'nonce="{self.nonce}", '
-            f'uri="{self.uri}", '
-            f'algorithm={self.algorithm}, '
-            f'response="{self.response}", '
-            f'qop={self.qop}, '
-            f'nc={self.nc}, '
-            f'cnonce="{self.cnonce}"'
-        )
-
-    # ------------------------------------------------------
+        if self.mode == 'Digest':
+            r = 'Digest '
+            args = []
+            for k, v in kwargs.items():
+                if k == 'algorithm':
+                    args.append('%s=%s' % (k, v))
+                else:
+                    args.append('%s="%s"' % (k, v))
+            r += ', '.join(args)
+        else:
+            raise ValueError('Authentication method not supported')
+        return r
 
     @classmethod
-    def from_header(cls, header: str, password: str, method: str) -> "DigestResponse":
-        """
-        Constrói um DigestResponse a partir de um cabeçalho Authorization SIP.
-        """
-        pattern = re.compile(r'(\w+)="?(.*?)"?(?:,|$)')
-        parts: Dict[str, str] = dict(pattern.findall(header))
+    def from_authorization_header(cls, authorization, method):
+        if authorization.startswith('Digest'):
+            params = {'method': method}
+            params.update(cls.__parse_digest(authorization))
+            auth = AuthorizationAuth(mode='Digest', **params)
+        else:
+            raise ValueError('Authentication method not supported')
+        return auth
 
-        return cls(
-            username=parts.get("username"),
+    @classmethod
+    def from_authenticate_header(cls, authenticate, method):
+        if authenticate.startswith('Digest'):
+            params = {'method': method}
+            params.update(cls.__parse_digest(authenticate))
+            auth = AuthenticateAuth(mode='Digest', **params)
+        else:
+            raise ValueError('Authentication method not supported')
+        return auth
+
+    @classmethod
+    def from_message(cls, message):
+        if 'Authorization' in message.headers:
+            return cls.from_authorization_header(message.headers['Authorization'], message.method)
+        elif 'WWW-Authenticate' in message.headers:
+            return cls.from_authenticate_header(message.headers['WWW-Authenticate'], message.method)
+        else:
+            return None
+
+    @classmethod
+    def __parse_digest(cls, header):
+        params = {}
+        for arg in header[7:].split(','):
+            k, v = arg.strip().split('=', 1)
+            if '="' in arg:
+                v = v[1:-1]
+            params[k] = v
+        return params
+
+    def _calculate_response(self, password, payload, username=None, uri=None, cnonce=None, nonce_count=None):
+        if self.mode != 'Digest':
+            raise ValueError('Authentication method not supported')
+
+        algorithm = Algorithm(self.get('algorithm', 'md5').lower())
+        qop = Directive(self.get('qop', '').lower())
+
+        if username is None:
+            username = self['username']
+        if uri is None:
+            uri = self['uri']
+
+        ha1 = md5digest(username, self['realm'], password)
+        if algorithm is Algorithm.MD5Sess:
+            ha1 = md5digest(ha1, self['nonce'], cnonce or self['cnonce'])
+
+        if qop is Directive.AuthInt:
+            ha2 = md5digest(self['method'], uri, md5digest(payload))
+        else:
+            ha2 = md5digest(self['method'], uri)
+
+        # If there's no quality of prootection specified, we can return early,
+        # our computation is much simpler
+        if qop is Directive.Unspecified:
+            return md5digest(ha1, self['nonce'], ha2)
+
+        return md5digest(
+            ha1,
+            self['nonce'],
+            nonce_count or self['nc'],
+            cnonce or self['cnonce'],
+            self['qop'],
+            ha2)
+
+    # MutableMapping API
+    def __eq__(self, other):
+        return self is other
+
+    def __getitem__(self, key):
+        return self._auth[key]
+
+    def __setitem__(self, key, value):
+        self._auth[key] = value
+
+    def __delitem__(self, key):
+        del self._auth[key]
+
+    def __len__(self):
+        return len(self._auth)
+
+    def __iter__(self):
+        return iter(self._auth)
+
+
+class AuthenticateAuth(Auth):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    def generate_authorization(self, username, password, uri, payload=''):
+        auth = AuthorizationAuth(mode=self.mode, uri=uri, username=username, response=None, **self)
+        auth['response'] = auth._calculate_response(
             password=password,
-            method=method,
-            uri=parts.get("uri"),
-            realm=parts.get("realm"),
-            nonce=parts.get("nonce"),
-            nc=parts.get("nc", "00000001"),
-            cnonce=parts.get("cnonce"),
-            qop=parts.get("qop", "auth"),
-            algorithm=parts.get("algorithm", "MD5"),
+            payload=payload
         )
+        return auth
 
-    # ------------------------------------------------------
+    def validate_authorization(self, authorization_auth, password, username, uri, payload=''):
+        response = self._calculate_response(
+                uri=uri,
+                payload=payload,
+                password=password,
+                username=username,
+                cnonce=authorization_auth.get('cnonce'),
+                nonce_count=authorization_auth.get('nc')
+            )
 
-    def verify(self, expected_password: str) -> bool:
-        """
-        Verifica se a resposta recebida bate com a senha esperada.
-        """
-        expected = DigestResponse(
-            username=self.username,
-            password=expected_password,
-            method=self.method,
-            uri=self.uri,
-            realm=self.realm,
-            nonce=self.nonce,
-            nc=self.nc,
-            cnonce=self.cnonce,
-            qop=self.qop,
-            algorithm=self.algorithm,
+        return response == authorization_auth['response']
+
+    def __str__(self):
+        kwargs = {k: v for k, v in self._auth.items() if k != 'method'}
+        return super().__str__(**kwargs)
+
+
+class AuthorizationAuth(Auth):
+
+    def __init__(self, *args, **kwargs):
+        self.nc = 0
+
+        if 'response' not in kwargs:
+            raise ValueError('No authentication response')
+
+        super().__init__(*args, **kwargs)
+
+    def _calculate_response(self, password, username=None, uri=None, payload='', cnonce=None, nonce_count=None):
+        if cnonce:
+            self.nc = nonce_count or self.nc + 1
+            self['nc'] = str(self.nc)
+            self['cnonce'] = cnonce
+        elif not cnonce and (
+            self.get('algorithm') == 'md5-sess' or
+            self.get('qop', '').lower() in ('auth', 'auth-int')
+        ):
+            self.nc = nonce_count or self.nc + 1
+            self['nc'] = str(self.nc)
+            self['cnonce'] = utils.gen_str(10)
+
+        return super()._calculate_response(
+            password=password,
+            username=username,
+            uri=uri,
+            payload=payload,
+            cnonce=self.get('cnonce'),
+            nonce_count=self.get('nc')
         )
-        return self.response == expected.response
