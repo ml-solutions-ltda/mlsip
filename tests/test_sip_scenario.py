@@ -1,4 +1,4 @@
-import aiosip
+import mlsip
 import pytest
 import asyncio
 
@@ -7,7 +7,7 @@ async def test_notify(test_server, protocol, loop, from_details, to_details, clo
     notify_list = [0, 1, 2, 3, 4]
     subscribe_future = loop.create_future()
 
-    class Dialplan(aiosip.BaseDialplan):
+    class Dialplan(mlsip.BaseDialplan):
 
         async def resolve(self, *args, **kwargs):
             await super().resolve(*args, **kwargs)
@@ -27,8 +27,8 @@ async def test_notify(test_server, protocol, loop, from_details, to_details, clo
                     expires = int(msg.headers['Expires'])
                     await dialog.reply(msg, status_code=200, headers={'Expires': expires})
 
-    app = aiosip.Application(loop=loop)
-    server_app = aiosip.Application(loop=loop, dialplan=Dialplan())
+    app = mlsip.Application(loop=loop)
+    server_app = mlsip.Application(loop=loop, dialplan=Dialplan())
     server = await test_server(server_app)
 
     peer = await app.connect(
@@ -38,8 +38,8 @@ async def test_notify(test_server, protocol, loop, from_details, to_details, clo
 
     subscribe_dialog = await peer.subscribe(
         expires=1800,
-        from_details=aiosip.Contact.from_header(from_details),
-        to_details=aiosip.Contact.from_header(to_details),
+        from_details=mlsip.Contact.from_header(from_details),
+        to_details=mlsip.Contact.from_header(to_details),
     )
 
     for expected in notify_list:
@@ -61,7 +61,7 @@ async def test_authentication(test_server, protocol, loop, from_details, to_deta
     password = 'abcdefg'
     received_messages = list()
 
-    class Dialplan(aiosip.BaseDialplan):
+    class Dialplan(mlsip.BaseDialplan):
 
         async def resolve(self, *args, **kwargs):
             await super().resolve(*args, **kwargs)
@@ -69,7 +69,6 @@ async def test_authentication(test_server, protocol, loop, from_details, to_deta
 
         async def subscribe(self, request, message):
             dialog = request._create_dialog()
-
             received_messages.append(message)
             assert not dialog.validate_auth(message=message, password=password)
             await dialog.unauthorized(message)
@@ -81,8 +80,8 @@ async def test_authentication(test_server, protocol, loop, from_details, to_deta
                 else:
                     await dialog.unauthorized(message)
 
-    app = aiosip.Application(loop=loop)
-    server_app = aiosip.Application(loop=loop, dialplan=Dialplan())
+    app = mlsip.Application(loop=loop)
+    server_app = mlsip.Application(loop=loop, dialplan=Dialplan())
     server = await test_server(server_app)
 
     peer = await app.connect(
@@ -92,8 +91,8 @@ async def test_authentication(test_server, protocol, loop, from_details, to_deta
 
     await peer.subscribe(
         expires=1800,
-        from_details=aiosip.Contact.from_header(from_details),
-        to_details=aiosip.Contact.from_header(to_details),
+        from_details=mlsip.Contact.from_header(from_details),
+        to_details=mlsip.Contact.from_header(to_details),
         password=password
     )
 
@@ -111,7 +110,7 @@ async def test_authentication(test_server, protocol, loop, from_details, to_deta
 async def test_authentication_rejection(test_server, protocol, loop, from_details, to_details, close_order):
     received_messages = list()
 
-    class Dialplan(aiosip.BaseDialplan):
+    class Dialplan(mlsip.BaseDialplan):
 
         async def resolve(self, *args, **kwargs):
             await super().resolve(*args, **kwargs)
@@ -119,7 +118,6 @@ async def test_authentication_rejection(test_server, protocol, loop, from_detail
 
         async def subscribe(self, request, message):
             dialog = request._create_dialog()
-
             received_messages.append(message)
             await dialog.unauthorized(message)
 
@@ -127,27 +125,25 @@ async def test_authentication_rejection(test_server, protocol, loop, from_detail
                 received_messages.append(message)
                 await dialog.unauthorized(message)
 
-    app = aiosip.Application(loop=loop)
-    server_app = aiosip.Application(loop=loop, dialplan=Dialplan())
+    app = mlsip.Application(loop=loop)
+    server_app = mlsip.Application(loop=loop, dialplan=Dialplan())
     server = await test_server(server_app)
 
     peer = await app.connect(
         protocol=protocol,
-        remote_addr=(
-            server.sip_config['server_host'],
-            server.sip_config['server_port'],
-        )
+        remote_addr=(server.sip_config['server_host'], server.sip_config['server_port'])
     )
-    with pytest.raises(aiosip.exceptions.AuthentificationFailed):
+
+    with pytest.raises(mlsip.exceptions.AuthenticationFailed):
         await peer.register(
             expires=1800,
-            from_details=aiosip.Contact.from_header(from_details),
-            to_details=aiosip.Contact.from_header(to_details),
+            from_details=mlsip.Contact.from_header(from_details),
+            to_details=mlsip.Contact.from_header(to_details),
             password='testing_pass',
         )
 
     assert len(received_messages) == 3
-    assert all(list('Authorization' in message.headers for message in received_messages[1:]))
+    assert all('Authorization' in message.headers for message in received_messages[1:])
 
     if close_order[0] == 'client':
         await app.close()
@@ -161,7 +157,7 @@ async def test_invite(test_server, protocol, loop, from_details, to_details, clo
     call_established = loop.create_future()
     call_disconnected = loop.create_future()
 
-    class Dialplan(aiosip.BaseDialplan):
+    class Dialplan(mlsip.BaseDialplan):
 
         async def resolve(self, *args, **kwargs):
             await super().resolve(*args, **kwargs)
@@ -181,8 +177,8 @@ async def test_invite(test_server, protocol, loop, from_details, to_details, clo
                     call_disconnected.set_result(None)
                     break
 
-    app = aiosip.Application(loop=loop, debug=True)
-    server_app = aiosip.Application(loop=loop, debug=True, dialplan=Dialplan())
+    app = mlsip.Application(loop=loop, debug=True)
+    server_app = mlsip.Application(loop=loop, debug=True, dialplan=Dialplan())
     server = await test_server(server_app)
 
     peer = await app.connect(
@@ -191,8 +187,8 @@ async def test_invite(test_server, protocol, loop, from_details, to_details, clo
     )
 
     call = await peer.invite(
-        from_details=aiosip.Contact.from_header(from_details),
-        to_details=aiosip.Contact.from_header(to_details),
+        from_details=mlsip.Contact.from_header(from_details),
+        to_details=mlsip.Contact.from_header(to_details),
     )
 
     responses = list()
@@ -218,7 +214,7 @@ async def test_invite(test_server, protocol, loop, from_details, to_details, clo
 async def test_cancel(test_server, protocol, loop, from_details, to_details, close_order):
     cancel_future = loop.create_future()
 
-    class Dialplan(aiosip.BaseDialplan):
+    class Dialplan(mlsip.BaseDialplan):
 
         async def resolve(self, *args, **kwargs):
             await super().resolve(*args, **kwargs)
@@ -234,8 +230,8 @@ async def test_cancel(test_server, protocol, loop, from_details, to_details, clo
         async def cancel(self, request, message):
             cancel_future.set_result(message)
 
-    app = aiosip.Application(loop=loop)
-    server_app = aiosip.Application(loop=loop, dialplan=Dialplan())
+    app = mlsip.Application(loop=loop)
+    server_app = mlsip.Application(loop=loop, dialplan=Dialplan())
     server = await test_server(server_app)
 
     peer = await app.connect(
@@ -243,9 +239,9 @@ async def test_cancel(test_server, protocol, loop, from_details, to_details, clo
         remote_addr=(server.sip_config['server_host'], server.sip_config['server_port'])
     )
 
-    pending_subscription = asyncio.ensure_future(peer.subscribe(
-        from_details=aiosip.Contact.from_header(from_details),
-        to_details=aiosip.Contact.from_header(to_details),
+    pending_subscription = asyncio.create_task(peer.subscribe(
+        from_details=mlsip.Contact.from_header(from_details),
+        to_details=mlsip.Contact.from_header(to_details),
     ))
 
     with pytest.raises(asyncio.CancelledError):

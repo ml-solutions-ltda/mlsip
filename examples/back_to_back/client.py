@@ -4,9 +4,9 @@ import contextlib
 import logging
 import random
 
-import aiosip
+import mlsip
 
-from aiosip.registration import Registration
+from mlsip.registration import Registration
 
 sip_config = {
     'srv_host': '127.0.0.1',
@@ -21,10 +21,10 @@ sip_config = {
 
 async def run_subscription(peer, user, duration):
     subscription = await peer.subscribe(
-        from_details=aiosip.Contact.from_header('sip:{}@{}:{}'.format(
+        from_details=mlsip.Contact.from_header('sip:{}@{}:{}'.format(
             sip_config['user'], sip_config['local_host'],
             sip_config['local_port'])),
-        to_details=aiosip.Contact.from_header('sip:{}@{}:{}'.format(
+        to_details=mlsip.Contact.from_header('sip:{}@{}:{}'.format(
             user, sip_config['srv_host'], sip_config['srv_port'])),
         password=sip_config['pwd'])
 
@@ -47,7 +47,7 @@ async def run_subscription(peer, user, duration):
 
 
 async def start(app, protocol, target, duration):
-    if protocol is aiosip.WS:
+    if protocol is mlsip.WS:
         peer = await app.connect(
             'ws://{}:{}'.format(sip_config['srv_host'], sip_config['srv_port']),
             protocol=protocol,
@@ -60,13 +60,13 @@ async def start(app, protocol, target, duration):
 
     registration = Registration(
         peer=peer,
-        from_details=aiosip.Contact.from_header('sip:{}@{}:{}'.format(
+        from_details=mlsip.Contact.from_header('sip:{}@{}:{}'.format(
             sip_config['user'], sip_config['local_host'],
             sip_config['local_port'])),
-        to_details=aiosip.Contact.from_header('sip:{}@{}:{}'.format(
+        to_details=mlsip.Contact.from_header('sip:{}@{}:{}'.format(
             sip_config['user'], sip_config['srv_host'],
             sip_config['srv_port'])),
-        contact_details=aiosip.Contact.from_header('sip:{}@{}:{}'.format(
+        contact_details=mlsip.Contact.from_header('sip:{}@{}:{}'.format(
             sip_config['user'], sip_config['local_host'],
             sip_config['local_port'])),
         password=sip_config['pwd']
@@ -89,14 +89,14 @@ def main():
     sip_config['user'] = args.user
 
     loop = asyncio.get_event_loop()
-    app = aiosip.Application(loop=loop)
+    app = mlsip.Application(loop=loop)
 
     if args.protocol == 'udp':
-        client = start(app, aiosip.UDP, args.target, args.duration)
+        client = start(app, mlsip.UDP, args.target, args.duration)
     elif args.protocol == 'tcp':
-        client = start(app, aiosip.TCP, args.target, args.duration)
+        client = start(app, mlsip.TCP, args.target, args.duration)
     elif args.protocol == 'ws':
-        client = start(app, aiosip.WS, args.target, args.duration)
+        client = start(app, mlsip.WS, args.target, args.duration)
     else:
         raise RuntimeError("Unsupported protocol: {}".format(args.protocol))
 

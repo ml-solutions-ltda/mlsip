@@ -2,7 +2,7 @@ import argparse
 import asyncio
 import logging
 
-import aiosip
+import mlsip
 
 sip_config = {
     'srv_host': 'xxxxxx',
@@ -30,7 +30,7 @@ async def on_invite(request, message):
             break
 
 
-class Dialplan(aiosip.BaseDialplan):
+class Dialplan(mlsip.BaseDialplan):
 
     async def resolve(self, *args, **kwargs):
         await super().resolve(*args, **kwargs)
@@ -63,14 +63,14 @@ def main():
     args = parser.parse_args()
 
     loop = asyncio.get_event_loop()
-    app = aiosip.Application(loop=loop, dialplan=Dialplan())
+    app = mlsip.Application(loop=loop, dialplan=Dialplan())
 
     if args.protocol == 'udp':
-        start(app, aiosip.UDP)
+        start(app, mlsip.UDP)
     elif args.protocol == 'tcp':
-        start(app, aiosip.TCP)
+        start(app, mlsip.TCP)
     elif args.protocol == 'ws':
-        start(app, aiosip.WS)
+        start(app, mlsip.WS)
     else:
         raise RuntimeError("Unsupported protocol: {}".format(args.protocol))
 

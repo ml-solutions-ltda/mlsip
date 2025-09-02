@@ -4,9 +4,9 @@ import itertools
 import logging
 import random
 
-import aiosip
+import mlsip
 
-from aiosip.registration import Registration
+from mlsip.registration import Registration
 
 sip_config = {
     'srv_host': '127.0.0.1',
@@ -46,7 +46,7 @@ async def on_subscribe(request, message):
     print('Subscription ended!')
 
 
-class Dialplan(aiosip.BaseDialplan):
+class Dialplan(mlsip.BaseDialplan):
 
     async def resolve(self, *args, **kwargs):
         await super().resolve(*args, **kwargs)
@@ -63,7 +63,7 @@ async def start(app, protocol):
     print('Serving on {} {}'.format(
         (sip_config['local_host'], sip_config['local_port']), protocol))
 
-    if protocol is aiosip.WS:
+    if protocol is mlsip.WS:
         peer = await app.connect(
             'ws://{}:{}'.format(sip_config['srv_host'], sip_config['srv_port']),
             protocol=protocol,
@@ -76,13 +76,13 @@ async def start(app, protocol):
 
     return Registration(
         peer=peer,
-        from_details=aiosip.Contact.from_header('sip:{}@{}:{}'.format(
+        from_details=mlsip.Contact.from_header('sip:{}@{}:{}'.format(
             sip_config['user'], sip_config['local_host'],
             sip_config['local_port'])),
-        to_details=aiosip.Contact.from_header('sip:{}@{}:{}'.format(
+        to_details=mlsip.Contact.from_header('sip:{}@{}:{}'.format(
             sip_config['user'], sip_config['srv_host'],
             sip_config['srv_port'])),
-        contact_details=aiosip.Contact.from_header('sip:{}@{}:{}'.format(
+        contact_details=mlsip.Contact.from_header('sip:{}@{}:{}'.format(
             sip_config['user'], sip_config['local_host'],
             sip_config['local_port'])),
         password=sip_config['pwd']
@@ -98,14 +98,14 @@ def main():
     sip_config['user'] = args.user
 
     loop = asyncio.get_event_loop()
-    app = aiosip.Application(loop=loop, dialplan=Dialplan())
+    app = mlsip.Application(loop=loop, dialplan=Dialplan())
 
     if args.protocol == 'udp':
-        server = start(app, aiosip.UDP)
+        server = start(app, mlsip.UDP)
     elif args.protocol == 'tcp':
-        server = start(app, aiosip.TCP)
+        server = start(app, mlsip.TCP)
     elif args.protocol == 'ws':
-        server = start(app, aiosip.WS)
+        server = start(app, mlsip.WS)
     else:
         raise RuntimeError("Unsupported protocol: {}".format(args.protocol))
 
