@@ -30,7 +30,7 @@ test_requirements = [
 
 setup(
     name='mlsip',  # seu pacote agora se chama mlsip
-    version='0.1.1',  # versão inicial do seu pacote
+    version='0.1.2',  # versão inicial do seu pacote
     description='SIP support for AsyncIO - custom package',
     long_description=readme + '\n\n' + history,
     author='ML Solutions',
